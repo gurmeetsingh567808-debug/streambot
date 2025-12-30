@@ -1,16 +1,22 @@
 import os
 import uuid
+import time
 import sqlite3
+import asyncio
 from flask import Flask, Response, redirect
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ===== ENV VARIABLES (RENDER) =====
-API_ID = int(os.environ.get("API_ID"))
-API_HASH = os.environ.get("API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+# ================== CONFIG ==================
 
-# ===== DATABASE =====
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+
+STREAM_TIMEOUT = 30  # seconds
+
+# ================== DATABASE ==================
+
 db = sqlite3.connect("videos.db", check_same_thread=False)
 cursor = db.cursor()
 cursor.execute("""
@@ -22,7 +28,12 @@ CREATE TABLE IF NOT EXISTS videos (
 """)
 db.commit()
 
-# ===== TELEGRAM CLIENT =====
+# ================== STATE ==================
+
+STREAM_WAIT = {}  # user_id : timestamp
+
+# ================== TELEGRAM BOT ==================
+
 tg = Client(
     "streambot",
     api_id=API_ID,
@@ -30,40 +41,37 @@ tg = Client(
     bot_token=BOT_TOKEN
 )
 
-# ===== FLASK APP =====
-app = Flask(__name__)
-
-# ================== BOT LOGIC ==================
+@tg.on_message(filters.command("start"))
+async def start_cmd(client, message):
+    await message.reply(
+        "✅ Bot is running\n\n"
+        "Use /stream and then send ONE video (within 30 sec)"
+    )
 
 @tg.on_message(filters.command("stream"))
 async def stream_cmd(client, message):
-    # CASE: /stream + direct link
-    if len(message.command) > 1:
-        url = message.command[1]
-        vid = str(uuid.uuid4())
+    user_id = message.from_user.id
 
-        cursor.execute(
-            "INSERT INTO videos VALUES (?, ?, ?)",
-            (vid, "url", url)
-        )
-        db.commit()
-
-        watch = f"{BASE_URL}/watch/{vid}"
-
-        await message.reply(
-            "▶️ Stream ready",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("Watch Online", url=watch)]]
-            )
-        )
+    if user_id in STREAM_WAIT:
+        await message.reply("⚠️ Already waiting for a video.")
         return
 
-    await message.reply("🎬 Ab video bhejo (sirf /stream ke baad)")
+    STREAM_WAIT[user_id] = time.time()
+    await message.reply("🎬 Send one video within 30 seconds")
 
 @tg.on_message(filters.video)
 async def video_handler(client, message):
-    if not message.reply_to_message:
+    user_id = message.from_user.id
+
+    if user_id not in STREAM_WAIT:
         return
+
+    if time.time() - STREAM_WAIT[user_id] > STREAM_TIMEOUT:
+        STREAM_WAIT.pop(user_id, None)
+        await message.reply("⏱️ Timeout. Use /stream again.")
+        return
+
+    STREAM_WAIT.pop(user_id, None)
 
     vid = str(uuid.uuid4())
     file_id = message.video.file_id
@@ -74,8 +82,9 @@ async def video_handler(client, message):
     )
     db.commit()
 
-    watch = f"{BASE_URL}/watch/{vid}"
-    download = f"{BASE_URL}/download/{vid}"
+    base = os.environ.get("RENDER_EXTERNAL_URL", "")
+    watch = f"{base}/watch/{vid}"
+    download = f"{base}/download/{vid}"
 
     await message.reply(
         "✅ Video ready",
@@ -85,7 +94,13 @@ async def video_handler(client, message):
         ])
     )
 
-# ================== WEBSITE ==================
+# ================== FLASK APP ==================
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Bot is running ✅"
 
 @app.route("/watch/<vid>")
 def watch(vid):
@@ -103,12 +118,12 @@ def watch(vid):
 @app.route("/stream/<vid>")
 def stream(vid):
     cursor.execute("SELECT type, value FROM videos WHERE id=?", (vid,))
-    data = cursor.fetchone()
+    row = cursor.fetchone()
 
-    if not data:
+    if not row:
         return "Invalid link", 404
 
-    vtype, value = data
+    vtype, value = row
 
     if vtype == "url":
         return redirect(value)
@@ -123,11 +138,12 @@ def download(vid):
     path = tg.download_media(file_id)
     return open(path, "rb").read()
 
-# ================== RUN ==================
+# ================== RUN BOTH ==================
 
-if __name__ == "__main__":
-    BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
-    tg.start()
-
+async def main():
+    await tg.start()
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
+if __name__ == "__main__":
+    asyncio.run(main())
