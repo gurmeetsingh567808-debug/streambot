@@ -2,20 +2,16 @@ import os
 import uuid
 import time
 import sqlite3
+import asyncio
 from flask import Flask, Response, redirect
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ================== CONFIG ==================
 
-API_ID = int(os.environ.get("API_ID"))
-API_HASH = os.environ.get("API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-
-# 🔐 ADMIN IDS (Telegram user IDs)
-ADMINS = {
-    6690196088,   # <-- apna Telegram user ID yahan daalo
-}
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 STREAM_TIMEOUT = 30  # seconds
 
@@ -34,10 +30,9 @@ db.commit()
 
 # ================== STATE ==================
 
-# user_id : timestamp
-STREAM_WAIT = {}
+STREAM_WAIT = {}  # user_id : timestamp
 
-# ================== BOT ==================
+# ================== TELEGRAM BOT ==================
 
 tg = Client(
     "streambot",
@@ -46,69 +41,36 @@ tg = Client(
     bot_token=BOT_TOKEN
 )
 
-# ================== FLASK ==================
-
-app = Flask(__name__)
-
-# ================== BOT LOGIC ==================
+@tg.on_message(filters.command("start"))
+async def start_cmd(client, message):
+    await message.reply(
+        "✅ Bot is running\n\n"
+        "Use /stream and then send ONE video (within 30 sec)"
+    )
 
 @tg.on_message(filters.command("stream"))
 async def stream_cmd(client, message):
     user_id = message.from_user.id
 
-    # 🔐 Admin only
-    if user_id not in ADMINS:
-        await message.reply("❌ You are not allowed to use this command.")
-        return
-
-    # ❌ Already waiting (block multiple)
     if user_id in STREAM_WAIT:
-        await message.reply("⚠️ Pehle wala /stream cancel hone do.")
+        await message.reply("⚠️ Already waiting for a video.")
         return
 
-    # ⏱️ set waiting state
     STREAM_WAIT[user_id] = time.time()
-
-    # CASE: direct link
-    if len(message.command) > 1:
-        url = message.command[1]
-        vid = str(uuid.uuid4())
-
-        cursor.execute(
-            "INSERT INTO videos VALUES (?, ?, ?)",
-            (vid, "url", url)
-        )
-        db.commit()
-
-        STREAM_WAIT.pop(user_id, None)
-
-        watch = f"{BASE_URL}/watch/{vid}"
-
-        await message.reply(
-            "▶️ Stream ready",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("Watch Online", url=watch)]]
-            )
-        )
-        return
-
-    await message.reply("🎬 Ab 30 sec ke andar ek video bhejo")
+    await message.reply("🎬 Send one video within 30 seconds")
 
 @tg.on_message(filters.video)
 async def video_handler(client, message):
     user_id = message.from_user.id
 
-    # ❌ Not in stream mode
     if user_id not in STREAM_WAIT:
         return
 
-    # ⏱️ Timeout check
     if time.time() - STREAM_WAIT[user_id] > STREAM_TIMEOUT:
         STREAM_WAIT.pop(user_id, None)
-        await message.reply("⏱️ Timeout ho gaya. Dobara /stream use karo.")
+        await message.reply("⏱️ Timeout. Use /stream again.")
         return
 
-    # ✅ Accept only one video
     STREAM_WAIT.pop(user_id, None)
 
     vid = str(uuid.uuid4())
@@ -120,8 +82,9 @@ async def video_handler(client, message):
     )
     db.commit()
 
-    watch = f"{BASE_URL}/watch/{vid}"
-    download = f"{BASE_URL}/download/{vid}"
+    base = os.environ.get("RENDER_EXTERNAL_URL", "")
+    watch = f"{base}/watch/{vid}"
+    download = f"{base}/download/{vid}"
 
     await message.reply(
         "✅ Video ready",
@@ -131,7 +94,13 @@ async def video_handler(client, message):
         ])
     )
 
-# ================== WEBSITE ==================
+# ================== FLASK APP ==================
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Bot is running ✅"
 
 @app.route("/watch/<vid>")
 def watch(vid):
@@ -149,12 +118,12 @@ def watch(vid):
 @app.route("/stream/<vid>")
 def stream(vid):
     cursor.execute("SELECT type, value FROM videos WHERE id=?", (vid,))
-    data = cursor.fetchone()
+    row = cursor.fetchone()
 
-    if not data:
+    if not row:
         return "Invalid link", 404
 
-    vtype, value = data
+    vtype, value = row
 
     if vtype == "url":
         return redirect(value)
@@ -169,11 +138,12 @@ def download(vid):
     path = tg.download_media(file_id)
     return open(path, "rb").read()
 
-# ================== RUN ==================
+# ================== RUN BOTH ==================
 
-if __name__ == "__main__":
-    BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
-    tg.start()
-
+async def main():
+    await tg.start()
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
+if __name__ == "__main__":
+    asyncio.run(main())
