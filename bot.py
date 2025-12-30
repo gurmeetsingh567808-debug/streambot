@@ -1,14 +1,16 @@
+import os
+import uuid
+import sqlite3
+from flask import Flask, Response, redirect
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-import sqlite3, uuid, re
 
-API_ID = 123456
-API_HASH = "API_HASH"
-BOT_TOKEN = "BOT_TOKEN"
+# ===== ENV VARIABLES (RENDER) =====
+API_ID = int(os.environ.get("API_ID"))
+API_HASH = os.environ.get("API_HASH")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-app = Client("streambot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-# DB
+# ===== DATABASE =====
 db = sqlite3.connect("videos.db", check_same_thread=False)
 cursor = db.cursor()
 cursor.execute("""
@@ -20,10 +22,22 @@ CREATE TABLE IF NOT EXISTS videos (
 """)
 db.commit()
 
-# /stream command
-@app.on_message(filters.command("stream"))
+# ===== TELEGRAM CLIENT =====
+tg = Client(
+    "streambot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
+
+# ===== FLASK APP =====
+app = Flask(__name__)
+
+# ================== BOT LOGIC ==================
+
+@tg.on_message(filters.command("stream"))
 async def stream_cmd(client, message):
-    # CASE 2: direct link
+    # CASE: /stream + direct link
     if len(message.command) > 1:
         url = message.command[1]
         vid = str(uuid.uuid4())
@@ -34,30 +48,25 @@ async def stream_cmd(client, message):
         )
         db.commit()
 
-        watch = f"https://YOUR-SITE.onrender.com/watch/{vid}"
-        buttons = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("▶️ Watch Online", url=watch)]]
-        )
+        watch = f"{BASE_URL}/watch/{vid}"
 
-        await message.reply("🔴 Streaming link ready:", reply_markup=buttons)
+        await message.reply(
+            "▶️ Stream ready",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Watch Online", url=watch)]]
+            )
+        )
         return
 
-    # CASE 1: wait for video
-    await message.reply(
-        "🎬 Ab video bhejo jise stream karna hai.\n\n"
-        "❗ Sirf is command ke baad hi video accept hogi."
-    )
+    await message.reply("🎬 Ab video bhejo (sirf /stream ke baad)")
 
-    app.listen(chat_id=message.chat.id, filters=filters.video, timeout=60)
-
-# video after /stream
-@app.on_message(filters.video)
-async def handle_video(client, message):
+@tg.on_message(filters.video)
+async def video_handler(client, message):
     if not message.reply_to_message:
         return
 
-    file_id = message.video.file_id
     vid = str(uuid.uuid4())
+    file_id = message.video.file_id
 
     cursor.execute(
         "INSERT INTO videos VALUES (?, ?, ?)",
@@ -65,14 +74,60 @@ async def handle_video(client, message):
     )
     db.commit()
 
-    watch = f"https://YOUR-SITE.onrender.com/watch/{vid}"
-    download = f"https://YOUR-SITE.onrender.com/download/{vid}"
+    watch = f"{BASE_URL}/watch/{vid}"
+    download = f"{BASE_URL}/download/{vid}"
 
-    buttons = InlineKeyboardMarkup([
-        [InlineKeyboardButton("▶️ Watch Online", url=watch)],
-        [InlineKeyboardButton("⬇️ Download", url=download)]
-    ])
+    await message.reply(
+        "✅ Video ready",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("▶️ Watch Online", url=watch)],
+            [InlineKeyboardButton("⬇️ Download", url=download)]
+        ])
+    )
 
-    await message.reply("✅ Video stream ready:", reply_markup=buttons)
+# ================== WEBSITE ==================
 
-app.run()
+@app.route("/watch/<vid>")
+def watch(vid):
+    return f"""
+    <html>
+    <body>
+    <h3>Streaming</h3>
+    <video controls width="100%">
+        <source src="/stream/{vid}">
+    </video>
+    </body>
+    </html>
+    """
+
+@app.route("/stream/<vid>")
+def stream(vid):
+    cursor.execute("SELECT type, value FROM videos WHERE id=?", (vid,))
+    data = cursor.fetchone()
+
+    if not data:
+        return "Invalid link", 404
+
+    vtype, value = data
+
+    if vtype == "url":
+        return redirect(value)
+
+    file = tg.download_media(value, in_memory=True)
+    return Response(file, mimetype="video/mp4")
+
+@app.route("/download/<vid>")
+def download(vid):
+    cursor.execute("SELECT value FROM videos WHERE id=?", (vid,))
+    file_id = cursor.fetchone()[0]
+    path = tg.download_media(file_id)
+    return open(path, "rb").read()
+
+# ================== RUN ==================
+
+if __name__ == "__main__":
+    BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+    tg.start()
+
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
