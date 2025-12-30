@@ -1,16 +1,26 @@
 import os
 import uuid
+import time
 import sqlite3
 from flask import Flask, Response, redirect
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ===== ENV VARIABLES (RENDER) =====
+# ================== CONFIG ==================
+
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# ===== DATABASE =====
+# 🔐 ADMIN IDS (Telegram user IDs)
+ADMINS = {
+    6690196088,   # <-- apna Telegram user ID yahan daalo
+}
+
+STREAM_TIMEOUT = 30  # seconds
+
+# ================== DATABASE ==================
+
 db = sqlite3.connect("videos.db", check_same_thread=False)
 cursor = db.cursor()
 cursor.execute("""
@@ -22,7 +32,13 @@ CREATE TABLE IF NOT EXISTS videos (
 """)
 db.commit()
 
-# ===== TELEGRAM CLIENT =====
+# ================== STATE ==================
+
+# user_id : timestamp
+STREAM_WAIT = {}
+
+# ================== BOT ==================
+
 tg = Client(
     "streambot",
     api_id=API_ID,
@@ -30,14 +46,30 @@ tg = Client(
     bot_token=BOT_TOKEN
 )
 
-# ===== FLASK APP =====
+# ================== FLASK ==================
+
 app = Flask(__name__)
 
 # ================== BOT LOGIC ==================
 
 @tg.on_message(filters.command("stream"))
 async def stream_cmd(client, message):
-    # CASE: /stream + direct link
+    user_id = message.from_user.id
+
+    # 🔐 Admin only
+    if user_id not in ADMINS:
+        await message.reply("❌ You are not allowed to use this command.")
+        return
+
+    # ❌ Already waiting (block multiple)
+    if user_id in STREAM_WAIT:
+        await message.reply("⚠️ Pehle wala /stream cancel hone do.")
+        return
+
+    # ⏱️ set waiting state
+    STREAM_WAIT[user_id] = time.time()
+
+    # CASE: direct link
     if len(message.command) > 1:
         url = message.command[1]
         vid = str(uuid.uuid4())
@@ -47,6 +79,8 @@ async def stream_cmd(client, message):
             (vid, "url", url)
         )
         db.commit()
+
+        STREAM_WAIT.pop(user_id, None)
 
         watch = f"{BASE_URL}/watch/{vid}"
 
@@ -58,12 +92,24 @@ async def stream_cmd(client, message):
         )
         return
 
-    await message.reply("🎬 Ab video bhejo (sirf /stream ke baad)")
+    await message.reply("🎬 Ab 30 sec ke andar ek video bhejo")
 
 @tg.on_message(filters.video)
 async def video_handler(client, message):
-    if not message.reply_to_message:
+    user_id = message.from_user.id
+
+    # ❌ Not in stream mode
+    if user_id not in STREAM_WAIT:
         return
+
+    # ⏱️ Timeout check
+    if time.time() - STREAM_WAIT[user_id] > STREAM_TIMEOUT:
+        STREAM_WAIT.pop(user_id, None)
+        await message.reply("⏱️ Timeout ho gaya. Dobara /stream use karo.")
+        return
+
+    # ✅ Accept only one video
+    STREAM_WAIT.pop(user_id, None)
 
     vid = str(uuid.uuid4())
     file_id = message.video.file_id
